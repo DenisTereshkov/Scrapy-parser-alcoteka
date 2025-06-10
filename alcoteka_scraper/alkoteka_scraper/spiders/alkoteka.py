@@ -5,8 +5,6 @@ import re
 import time
 from html import unescape
 
-from tqdm import tqdm
-
 from ..constants import (
     ALLOWED_DOMAINS,
     CITY_UUID,
@@ -16,9 +14,9 @@ from ..constants import (
 
 class AlkotekaSpider(scrapy.Spider):
     name = "alkoteka"
-    allowed_domains = ALLOWED_DOMAINS   
+    allowed_domains = ALLOWED_DOMAINS
     city_uuid = CITY_UUID
-    per_page = 40
+    processed_count = 0
 
     def __init__(self, urls_file=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -26,70 +24,134 @@ class AlkotekaSpider(scrapy.Spider):
             file_path = os.path.abspath(urls_file)
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
-                    self.start_urls = [line.strip() for line in f if line.strip()]
-                self.logger.info(f"Загружено {len(self.start_urls)} ссылок из файла: {file_path}")
+                    self.start_urls = [
+                        line.strip() for line in f if line.strip()
+                    ]
+                self.logger.info(
+                    f"Загружено {len(self.start_urls)}"
+                    f"ссылок из файла: {file_path}"
+                )
             except FileNotFoundError:
                 self.logger.error(f"Файл не найден: {file_path}")
                 self.start_urls = START_URLS
         else:
-            self.logger.info("Аргумент urls_file не передан. Используются ссылки по умолчанию.")
+            self.logger.info(
+                "Используются ссылки по умолчанию."
+            )
             self.start_urls = START_URLS
+
+    def errback(self, failure):
+        """Обработчик ошибок для всех запросов"""
+        self.logger.error(
+            f'Ошибка при обработке запроса: {failure.request.url}'
+        )
+        if failure.check(scrapy.exceptions.TimeoutError):
+            self.logger.warning('Таймаут при запросе')
+        elif failure.check(scrapy.exceptions.TCPTimedOutError):
+            self.logger.warning('Таймаут TCP соединения')
+        else:
+            self.logger.warning(f'Другая ошибка: {failure.getTraceback()}')
 
     def closed(self, reason):
         self.logger.info(f"Парсер завершил работу. Причина: {reason}")
 
     def parse(self, response):
         slug = response.url.split('/catalog/')[-1].strip('/')
-        api_url = f'https://alkoteka.com/web-api/v1/product?city_uuid={self.city_uuid}&root_category_slug={slug}'
+        api_url = (
+            f'https://alkoteka.com/web-api/v1/product?'
+            f'city_uuid={self.city_uuid}&root_category_slug={slug}'
+        )
         yield scrapy.Request(
             api_url,
             callback=self.parse_total_items,
             meta={'city_uuid': self.city_uuid, 'root_category_slug': slug, }
         )
-    
-    def parse_total_items(self, response):
-        slug = response.meta.get('root_category_slug')
-        data = json.loads(response.text)
-        meta = data.get("meta", {})
-        page = 1
-        total_items = meta.get('total')
-        api_url = f'https://alkoteka.com/web-api/v1/product?city_uuid={self.city_uuid}&page={page}&per_page={total_items}&root_category_slug={slug}'
-        yield scrapy.Request(
-            api_url,
-            callback=self.parse_api,
-            meta={'city_uuid': self.city_uuid, 'root_category_slug': slug, }
-        )
 
+    def parse_total_items(self, response):
+        try:
+            data = json.loads(response.text)
+            meta = data.get("meta", {})
+            slug = response.meta.get('root_category_slug')
+            total_items = meta.get('total', 0)
+            if not total_items:
+                self.logger.warning(f"Нет товаров в категории: {slug}")
+                return
+            api_url = (
+                'https://alkoteka.com/web-api/v1/'
+                f'product?city_uuid={self.city_uuid}'
+                f'&page=1&per_page={total_items}&root_category_slug={slug}'
+            )
+            return scrapy.Request(
+                api_url,
+                callback=self.parse_api,
+                meta={'city_uuid': self.city_uuid, 'root_category_slug': slug},
+                errback=self.errback
+            )
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Ошибка декодирования JSON: {e}")
 
     def parse_api(self, response):
-        data = json.loads(response.text)
-        products = data.get('results', [])
-
-        for product in tqdm(products, desc=f"Обработка продуктов категории {response.meta.get('root_category_slug')}", unit="продукт"):
-            slug = product.get('slug')
-            self.logger.info(f"{product.get('slug')}")
-            if slug:
-                detail_api_url = f'https://alkoteka.com/web-api/v1/product/{slug}?city_uuid={self.city_uuid}'
-                yield scrapy.Request(
-                    detail_api_url,
-                    callback=self.parse_product_detail,
-                    meta={
-                        'slug': slug,
-                        'product_url': product.get('product_url')
-                        }
+        """Парсинг API с корректным отображением прогресса"""
+        try:
+            data = json.loads(response.text)
+            products = data.get('results', [])
+            urls_to_parse = []
+            for product in products:
+                if not product.get('slug'):
+                    continue
+                url = (
+                    'https://alkoteka.com/web-api/v1/product/'
+                    f'{product["slug"]}?city_uuid={self.city_uuid}'
                 )
+                urls_to_parse.append({
+                    'url': url,
+                    'meta': {
+                        'slug': product['slug'],
+                        'product_url': product.get('product_url', '')
+                    }
+                })
+            for item in urls_to_parse:
+                yield scrapy.Request(
+                    item['url'],
+                    callback=self.parse_product_detail,
+                    meta=item['meta'],
+                    errback=self.errback
+                )
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Ошибка декодирования JSON: {e}")
 
     def parse_product_detail(self, response):
         if response.status == 429:
             retry_after = int(response.headers.get('Retry-After', 60))
-            self.logger.warning(f"Превышен лимит. Повтор через {retry_after} сек.")
+            self.logger.warning(
+                f"Превышен лимит. Повтор через {retry_after} сек."
+            )
             time.sleep(retry_after)
-            yield scrapy.Request(response.url, callback=self.parse_product_detail, dont_filter=True)
+            yield scrapy.Request(
+                response.url,
+                callback=self.parse_product_detail,
+                dont_filter=True,
+                meta=response.meta
+            )
         else:
-            product = json.loads(response.text)['results']
-            product_url = response.meta.get('product_url', '')
-            product['product_url'] = product_url
-            yield self.format_product_data(product)
+            try:
+                product = json.loads(response.text)['results']
+                if not product:
+                    self.logger.warning(
+                        "Пустой ответ для продукта: "
+                        f"{response.url}"
+                    )
+                    return
+                product['product_url'] = response.meta.get('product_url', '')
+                yield self.format_product_data(product)
+                self.processed_count += 1
+                if self.processed_count % 100 == 0:
+                    self.logger.info(
+                        "Обработано продуктов: "
+                        f"{self.processed_count}"
+                    )
+            except Exception as e:
+                self.logger.error(f"Ошибка обработки продукта: {e}")
 
     def format_product_data(self, product):
         timestamp = int(time.time())
@@ -107,7 +169,7 @@ class AlkotekaSpider(scrapy.Spider):
         except (TypeError, ValueError):
             current_price = 0.0
         prev_price_raw = product.get('prev_price')
-        if prev_price_raw is None: 
+        if prev_price_raw is None:
             original_price = current_price
         else:
             try:
@@ -116,11 +178,31 @@ class AlkotekaSpider(scrapy.Spider):
                 original_price = current_price
         sale_tag = ""
         if original_price > current_price and original_price > 0:
-            discount_percentage = int(round((original_price - current_price) / original_price * 100))
+            discount_percentage = int(
+                round((original_price - current_price) / original_price * 100)
+            )
             sale_tag = f"Скидка {discount_percentage}%"
-        in_stock = product.get('available', False)
-        count = product.get('quantity_total', 0) if in_stock else 0
-        marketing_tags = [tag.get('title', "") for tag in product.get('filter_labels', []) if tag.get('title')]
+        availability = product.get('availability', {})
+        stores = availability.get('stores', [])
+        in_stock = False
+        count = 0
+        if stores:
+            in_stock = True
+            for store in stores:
+                try:
+                    quantity = store.get('quantity', '0 шт')
+                    count += int(quantity.split(' ')[0])
+                except (ValueError, AttributeError):
+                    self.logger.warning(
+                        "Не удалось получить количество товара из магазина: "
+                        f"{store.get('title')}"
+                    )
+        marketing_tags = [
+            tag.get('title', "") for tag in product.get(
+                'filter_labels',
+                []
+            ) if tag.get('title')
+        ]
         brand = ""
         for block in product.get("description_blocks", []):
             if block.get("code") == "brend":
