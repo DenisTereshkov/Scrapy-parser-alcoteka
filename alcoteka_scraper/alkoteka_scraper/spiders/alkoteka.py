@@ -1,7 +1,7 @@
-import scrapy
 import json
 import os
 import re
+import scrapy
 import time
 from html import unescape
 
@@ -13,12 +13,26 @@ from ..constants import (
 
 
 class AlkotekaSpider(scrapy.Spider):
+    """
+    Паук для сбора данных о товарах с сайта Alkoteka.
+    """
     name = "alkoteka"
     allowed_domains = ALLOWED_DOMAINS
     city_uuid = CITY_UUID
     processed_count = 0
 
     def __init__(self, urls_file=None, *args, **kwargs):
+        """
+        Инициализирует паука AlkotekaSpider.
+
+        Args:
+            urls_file (str, optional): Путь к файлу co списком URL для обхода.
+            Если не указан, используются URL по умолчанию (START_URLS).
+            *args: Дополнительные аргументы,
+                передаваемые в scrapy.Spider.__init__.
+            **kwargs: Дополнительные именованные аргументы,
+                передаваемые в scrapy.Spider.__init__.
+        """
         super().__init__(*args, **kwargs)
         if urls_file:
             file_path = os.path.abspath(urls_file)
@@ -41,7 +55,13 @@ class AlkotekaSpider(scrapy.Spider):
             self.start_urls = START_URLS
 
     def errback(self, failure):
-        """Обработчик ошибок для всех запросов"""
+        """
+        Обработчик ошибок для всех запросов.
+        Логирует информацию об ошибке, включая URL запроса и тип исключения.
+        Args:
+            failure (scrapy.Failure): Объект Failure,
+            содержащий информацию об ошибке.
+        """
         self.logger.error(
             f'Ошибка при обработке запроса: {failure.request.url}'
         )
@@ -53,9 +73,25 @@ class AlkotekaSpider(scrapy.Spider):
             self.logger.warning(f'Другая ошибка: {failure.getTraceback()}')
 
     def closed(self, reason):
+        """
+        Вызывается при завершении работы паука.
+        Логирует причину завершения работы.
+        Args:
+            reason (str): Причина завершения работы паука.
+        """
         self.logger.info(f"Парсер завершил работу. Причина: {reason}")
 
     def parse(self, response):
+        """
+        Обрабатывает страницу категории.
+        Формирует запрос к API для получения общего количества товаров.
+        Args:
+            response (scrapy.http.Response): Объект Response,
+                содержащий HTML-код страницы.
+        Yields:
+            scrapy.Request: Запрос к API
+                для получения общего количества товаров в категории.
+        """
         slug = response.url.split('/catalog/')[-1].strip('/')
         api_url = (
             f'https://alkoteka.com/web-api/v1/product?'
@@ -68,6 +104,17 @@ class AlkotekaSpider(scrapy.Spider):
         )
 
     def parse_total_items(self, response):
+        """
+        Обрабатывает ответ API с общим количеством товаров в категории.
+        Формирует запрос к API для получения списка товаров
+            с учетом общего количества.
+        Args:
+            response (scrapy.http.Response): Объект Response,
+                содержащий JSON-ответ API.
+        Yields:
+            scrapy.Request: Запрос к API
+                для получения списка товаров в категории.
+        """
         try:
             data = json.loads(response.text)
             meta = data.get("meta", {})
@@ -91,7 +138,17 @@ class AlkotekaSpider(scrapy.Spider):
             self.logger.error(f"Ошибка декодирования JSON: {e}")
 
     def parse_api(self, response):
-        """Парсинг API с корректным отображением прогресса"""
+        """
+        Обрабатывает ответ API со списком товаров.
+        Извлекает slug каждого товара и формирует запрос к API
+            для получения детальной информации о товаре.
+        Args:
+            response (scrapy.http.Response): Объект Response,
+                содержащий JSON-ответ API.
+        Yields:
+            scrapy.Request: Запрос к API
+                для получения детальной информации о каждом товаре.
+        """
         try:
             data = json.loads(response.text)
             products = data.get('results', [])
@@ -121,6 +178,21 @@ class AlkotekaSpider(scrapy.Spider):
             self.logger.error(f"Ошибка декодирования JSON: {e}")
 
     def parse_product_detail(self, response):
+        """
+        Обрабатывает ответ API с детальной информацией о товаре.
+
+        В случае ошибки 429 (превышение лимита запросов)
+            повторяет запрос после паузы.
+        Извлекает данные о товаре и передает их в метод
+            format_product_data для форматирования.
+
+        Args:
+            response (scrapy.http.Response): Объект Response,
+                содержащий JSON-ответ API.
+
+        Yields:
+            dict: Отформатированные данные о товаре.
+        """
         if response.status == 429:
             retry_after = int(response.headers.get('Retry-After', 60))
             self.logger.warning(
@@ -154,6 +226,18 @@ class AlkotekaSpider(scrapy.Spider):
                 self.logger.error(f"Ошибка обработки продукта: {e}")
 
     def format_product_data(self, product):
+        """
+        Форматирует данные о продукте.
+        Извлекает различные атрибуты продукта, такие как название,
+            цена, наличие на складе,
+        изображения и метаданные, и возвращает их в виде словаря.
+
+        Args:
+            product (dict): Словарь с данными о продукте, полученными из API.
+
+        Returns:
+            dict: Отформатированные данные о продукте, готовые для сохранения.
+        """
         timestamp = int(time.time())
         title = product.get('name', '')
         self.logger.info(f"{title}")
